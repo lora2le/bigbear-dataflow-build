@@ -1,0 +1,424 @@
+name: 大熊的数据流｜桌面端构建
+run-name: ${{ inputs.publish && '正式发布' || '安全构建验证' }} · ${{ inputs.source_ref }} · ${{ inputs.source_commit }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Gitee 分支或版本标签的完整 ref
+        required: true
+        type: string
+      source_commit:
+        description: 必须检出的 40 位 Gitee 提交哈希
+        required: true
+        type: string
+      publish:
+        description: 是否正式发布到 CNB
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-build
+  cancel-in-progress: false
+
+env:
+  SOURCE_REF: ${{ inputs.source_ref }}
+  EXPECTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+  SOURCE_DIR: ${{ github.workspace }}/source
+  PUBLISH_RELEASE: ${{ inputs.publish }}
+  STAGING_TAG: actions-staging-${{ github.run_id }}
+
+jobs:
+  prepare_staging:
+    name: 准备临时二进制中转
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: 创建 Draft Release
+        shell: bash
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isDraft \
+            --jq '.[] | select(.isDraft and (.tagName | startswith("actions-staging-"))) | .tagName' \
+            | while IFS= read -r stale_tag; do
+                [[ -z "$stale_tag" ]] || gh release delete "$stale_tag" \
+                  --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              done
+          gh release create "$STAGING_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "临时构建 ${EXPECTED_SOURCE_COMMIT}" \
+            --notes "仅中转三平台二进制安装产物，任务结束后自动删除。" \
+            --draft
+
+  build:
+    name: ${{ matrix.label }}
+    needs: prepare_staging
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+            artifact: macos-arm64
+            platform: macos
+          - label: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: macos-x64
+            platform: macos
+          - label: Windows x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: windows-x64
+            platform: windows
+    defaults:
+      run:
+        working-directory: source
+    env:
+      PYTHONUTF8: "1"
+      BIGBEAR_VALIDATION_ONLY: ${{ inputs.publish && '0' || '1' }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - name: 从 Gitee 私有仓库读取指定提交
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          GITEE_DEPLOY_KEY: ${{ secrets.GITEE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "提交哈希格式无效"; exit 1; }
+          [[ "$SOURCE_REF" =~ ^refs/heads/main$|^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
+            || { echo "只允许 main 分支或 v 开头的版本标签"; exit 1; }
+          if [[ "$PUBLISH_RELEASE" == "true" && ! "$SOURCE_REF" =~ ^refs/tags/ ]]; then
+            echo "正式发布只能读取 Gitee 版本标签"
+            exit 1
+          fi
+          [[ -n "$GITEE_DEPLOY_KEY" ]] || { echo "缺少 GITEE_DEPLOY_KEY"; exit 1; }
+
+          key_path="$RUNNER_TEMP/gitee-deploy-key"
+          known_hosts="$RUNNER_TEMP/gitee-known-hosts"
+          cleanup_key() { rm -f -- "$key_path"; }
+          trap cleanup_key EXIT
+          printf '%s\n' "$GITEE_DEPLOY_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          cat > "$known_hosts" <<'EOF'
+          gitee.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEKxHSJ7084RmkJ4YdEi5tngynE8aZe2uEoVVsB/OvYN
+          EOF
+
+          git init --quiet "$SOURCE_DIR"
+          git -C "$SOURCE_DIR" remote add origin git@gitee.com:daxionglab/bigbear-dataflow.git
+          git -C "$SOURCE_DIR" \
+            -c core.sshCommand="ssh -i '$key_path' -o IdentitiesOnly=yes -o UserKnownHostsFile='$known_hosts' -o StrictHostKeyChecking=yes" \
+            fetch --quiet --no-tags --depth=1 origin "$SOURCE_REF"
+          actual_commit="$(git -C "$SOURCE_DIR" rev-parse 'FETCH_HEAD^{commit}')"
+          [[ "$actual_commit" == "$EXPECTED_SOURCE_COMMIT" ]] \
+            || { echo "Gitee 实际提交与发布输入不一致"; exit 1; }
+          git -C "$SOURCE_DIR" checkout --quiet --detach "$actual_commit"
+          git -C "$SOURCE_DIR" remote remove origin
+          cleanup_key
+          trap - EXIT
+          echo "已校验并读取 Gitee 提交：$actual_commit"
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: 安装 Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable 2026-10-15
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 复用固定模型与辅助工具
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            source/sidecar/.models
+            source/sidecar/.tools
+          key: sidecar-assets-${{ matrix.target }}-${{ hashFiles('source/sidecar/uv.lock', 'source/sidecar/content_sidecar/providers/semantic.py', 'source/scripts/build_sidecar.py') }}
+
+      - name: 校验发布输入与配置
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/prepare_release_config.mjs
+          node <<'NODE'
+          const config = require("./发布配置/公开配置.json");
+          const expectedRepository = `https://github.com/${process.env.GITHUB_REPOSITORY}`;
+          if (config.github_repository !== expectedRepository) {
+            throw new Error(`构建壳地址不一致：${config.github_repository}`);
+          }
+          if (process.env.PUBLISH_RELEASE === "true" && process.env.SOURCE_REF !== `refs/tags/${config.tag}`) {
+            throw new Error("Gitee 标签与发布配置不一致");
+          }
+          NODE
+          if [[ "$PUBLISH_RELEASE" == "true" && -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "正式发布缺少 TAURI_SIGNING_PRIVATE_KEY"
+            exit 1
+          fi
+
+      - name: 安装锁定依赖
+        shell: bash
+        run: |
+          if ! npm ci > "$RUNNER_TEMP/npm-install.log" 2>&1; then
+            echo "依赖安装失败；为避免公开源码片段，详细日志不输出到 Public 仓库"
+            exit 1
+          fi
+
+      - name: 运行测试
+        shell: bash
+        run: |
+          if ! npm run test:sidecar > "$RUNNER_TEMP/tests.log" 2>&1 \
+            || ! npm run test:release >> "$RUNNER_TEMP/tests.log" 2>&1; then
+            echo "测试失败；为避免公开源码片段，详细日志不输出到 Public 仓库"
+            exit 1
+          fi
+
+      - name: 构建当前平台安装包
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- "src-tauri/target/${{ matrix.target }}/release/bundle"
+          build_log="$RUNNER_TEMP/build-${{ matrix.artifact }}.log"
+          if [[ "${{ matrix.platform }}" == "macos" ]]; then
+            npm run tauri build -- --target "${{ matrix.target }}" \
+              --config src-tauri/.generated/tauri.release.conf.json > "$build_log" 2>&1
+          else
+            npm run tauri build -- --target "${{ matrix.target }}" --bundles nsis \
+              --config src-tauri/.generated/tauri.release.conf.json > "$build_log" 2>&1
+          fi || {
+            echo "${{ matrix.label }} 构建失败；为避免公开源码片段，详细日志不输出到 Public 仓库"
+            exit 1
+          }
+
+      - name: 校验并整理 macOS 产物
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="$(find src-tauri/target -path '*/release/bundle/macos/大熊的数据流.app' -type d -print -quit)"
+          [[ -n "$app_path" ]] || { echo "缺少 .app"; exit 1; }
+          codesign --verify --deep --strict "$app_path"
+          unexpected_source="$(find "$app_path" -type f \( -name '*.py' -o -name '*.pyc' -o -name '*.ts' -o -name '*.tsx' -o -name '*.rs' -o -name '*.map' -o -name 'package.json' -o -name 'Cargo.toml' \) -print)"
+          [[ -z "$unexpected_source" ]] || { echo "安装包中出现源码或构建文件"; exit 1; }
+
+          output="发布/云端产物/${{ matrix.artifact }}"
+          mkdir -p "$output"
+          dmg="$(find src-tauri/target -path '*/release/bundle/dmg/*.dmg' -type f -print -quit)"
+          [[ -n "$dmg" ]] || { echo "缺少 DMG"; exit 1; }
+          cp "$dmg" "$output/"
+          if [[ "$PUBLISH_RELEASE" == "true" ]]; then
+            updater="$(find src-tauri/target -path '*/release/bundle/macos/*.app.tar.gz' -type f -print -quit)"
+            signature="$(find src-tauri/target -path '*/release/bundle/macos/*.app.tar.gz.sig' -type f -print -quit)"
+            [[ -n "$updater" && -n "$signature" ]] || { echo "缺少 macOS 更新包或签名"; exit 1; }
+            cp "$updater" "$signature" "$output/"
+          fi
+
+      - name: 校验并整理 Windows x64 产物
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem src-tauri/target -Recurse -File -Filter "*-setup.exe" | Where-Object { $_.FullName -match "[\\/]bundle[\\/]nsis[\\/]" })
+          if ($installers.Count -ne 1) { throw "Windows NSIS 安装包数量应为 1，实际为 $($installers.Count)" }
+          $sidecars = @(Get-ChildItem src-tauri/binaries -File -Filter "content-sidecar-x86_64-pc-windows-msvc.exe")
+          if ($sidecars.Count -ne 1) { throw "缺少 Windows x64 Sidecar" }
+
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "bigbear-sidecar-smoke"
+          $configDir = Join-Path $smokeRoot "config"
+          $dataDir = Join-Path $smokeRoot "data"
+          New-Item -ItemType Directory -Force -Path $configDir, $dataDir | Out-Null
+          $reply = '{"id":"cloud-smoke","method":"hello","params":{}}' |
+            & $sidecars[0].FullName --config-dir $configDir --data-dir $dataDir |
+            ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $reply.id -ne "cloud-smoke" -or $reply.result.protocol -ne 1) {
+            throw "Windows x64 Sidecar 启动检查失败"
+          }
+
+          $output = "发布/云端产物/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          Copy-Item $installers[0].FullName $output
+          if ($env:PUBLISH_RELEASE -eq "true") {
+            $signatures = @(Get-ChildItem src-tauri/target -Recurse -File -Filter "*-setup.exe.sig" | Where-Object { $_.FullName -match "[\\/]bundle[\\/]nsis[\\/]" })
+            if ($signatures.Count -ne 1) { throw "缺少 Windows 更新签名" }
+            Copy-Item $signatures[0].FullName $output
+          }
+
+      - name: 上传当前平台二进制到 Draft Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/${{ matrix.artifact }}.tar.gz"
+          if [[ "${{ matrix.platform }}" == "macos" ]]; then
+            export COPYFILE_DISABLE=1
+          fi
+          tar -C 发布/云端产物 -czf "$archive" "${{ matrix.artifact }}"
+          gh release upload "$STAGING_TAG" "$archive" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+  release:
+    name: 发布到 CNB
+    if: ${{ inputs.publish }}
+    needs: [prepare_staging, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: source
+    env:
+      PYTHONUTF8: "1"
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: 从 Gitee 私有仓库读取指定提交
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          GITEE_DEPLOY_KEY: ${{ secrets.GITEE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ && "$SOURCE_REF" =~ ^refs/tags/v ]] \
+            || { echo "正式发布输入无效"; exit 1; }
+          [[ -n "$GITEE_DEPLOY_KEY" ]] || { echo "缺少 GITEE_DEPLOY_KEY"; exit 1; }
+          key_path="$RUNNER_TEMP/gitee-deploy-key"
+          known_hosts="$RUNNER_TEMP/gitee-known-hosts"
+          cleanup_key() { rm -f -- "$key_path"; }
+          trap cleanup_key EXIT
+          printf '%s\n' "$GITEE_DEPLOY_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          printf '%s\n' 'gitee.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEKxHSJ7084RmkJ4YdEi5tngynE8aZe2uEoVVsB/OvYN' > "$known_hosts"
+          git init --quiet "$SOURCE_DIR"
+          git -C "$SOURCE_DIR" remote add origin git@gitee.com:daxionglab/bigbear-dataflow.git
+          git -C "$SOURCE_DIR" \
+            -c core.sshCommand="ssh -i '$key_path' -o IdentitiesOnly=yes -o UserKnownHostsFile='$known_hosts' -o StrictHostKeyChecking=yes" \
+            fetch --quiet --no-tags --depth=1 origin "$SOURCE_REF"
+          actual_commit="$(git -C "$SOURCE_DIR" rev-parse 'FETCH_HEAD^{commit}')"
+          [[ "$actual_commit" == "$EXPECTED_SOURCE_COMMIT" ]] \
+            || { echo "Gitee 实际提交与发布输入不一致"; exit 1; }
+          git -C "$SOURCE_DIR" checkout --quiet --detach "$actual_commit"
+          git -C "$SOURCE_DIR" remote remove origin
+          cleanup_key
+          trap - EXIT
+
+      - name: 安装 Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: 从 Draft Release 下载三个桌面平台产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          download_root="$RUNNER_TEMP/staging-download"
+          mkdir -p "$download_root" 发布/云端产物
+          gh release download "$STAGING_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$download_root"
+          expected="macos-arm64.tar.gz macos-x64.tar.gz windows-x64.tar.gz"
+          actual="$(find "$download_root" -maxdepth 1 -type f -name '*.tar.gz' -exec basename {} \; | sort | tr '\n' ' ' | sed 's/ $//')"
+          [[ "$actual" == "$expected" ]] || { echo "临时中转产物异常：$actual"; exit 1; }
+          for archive in "$download_root"/*.tar.gz; do
+            tar --exclude='*/._*' -xzf "$archive" -C 发布/云端产物
+          done
+
+      - name: 生成并校验正式发布内容
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p 发布/正式产物
+          python 构建/prepare_release_artifacts.py 发布/云端产物 发布/正式产物
+          python 构建/generate_update_manifest.py 发布/正式产物 发布/正式产物/latest.json
+          python 构建/prepare_cnb_repository.py 发布/正式产物/latest.json "$RUNNER_TEMP/cnb-public"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = json.loads(Path("发布配置/公开配置.json").read_text(encoding="utf-8"))
+          if os.environ["SOURCE_REF"] != f"refs/tags/{config['tag']}":
+              raise SystemExit("Gitee 标签与发布配置不一致")
+          expected = {"README.md", "latest.json"}
+          actual = {path.name for path in Path(os.environ["RUNNER_TEMP"], "cnb-public").iterdir()}
+          if actual != expected:
+              raise SystemExit(f"CNB 公开仓库范围异常：{sorted(actual)}")
+          PY
+
+      - name: 发布 CNB 公开仓库与 Release
+        shell: bash
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$CNB_TOKEN" ]] || { echo "缺少 CNB_TOKEN"; exit 1; }
+          python - <<'PY' > "$RUNNER_TEMP/cnb.env"
+          import json
+          from pathlib import Path
+          config = json.loads(Path("发布配置/公开配置.json").read_text(encoding="utf-8"))
+          print(f"CNB_REPOSITORY={config['cnb_repository']}")
+          print(f"DEFAULT_BRANCH={config['branch']}")
+          print(f"RELEASE_TAG={config['tag']}")
+          PY
+          . "$RUNNER_TEMP/cnb.env"
+          cat > "$RUNNER_TEMP/cnb-askpass.sh" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' "cnb" ;;
+            *Password*) printf '%s\n' "$CNB_TOKEN" ;;
+          esac
+          SH
+          chmod 700 "$RUNNER_TEMP/cnb-askpass.sh"
+          export GIT_ASKPASS="$RUNNER_TEMP/cnb-askpass.sh" GIT_TERMINAL_PROMPT=0
+          cd "$RUNNER_TEMP/cnb-public"
+          git init --quiet --initial-branch="$DEFAULT_BRANCH"
+          git config user.name "大熊"
+          git config user.email "bigbear@users.noreply.cnb.cool"
+          git add README.md latest.json
+          git commit --quiet -m "发布 $RELEASE_TAG"
+          git tag "$RELEASE_TAG"
+          git remote add cnb "${CNB_REPOSITORY}.git"
+          git push --force cnb "HEAD:refs/heads/${DEFAULT_BRANCH}"
+          git push --force cnb "refs/tags/${RELEASE_TAG}"
+          cd "$GITHUB_WORKSPACE/source"
+          python 构建/publish_cnb.py 发布/正式产物
+
+  cleanup_staging:
+    name: 清理临时二进制中转
+    if: ${{ always() && needs.prepare_staging.result == 'success' }}
+    needs: [prepare_staging, build, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: 删除 Draft Release 和临时标签
+        shell: bash
+        run: gh release delete "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
