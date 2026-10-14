@@ -49,7 +49,7 @@ jobs:
             --jq '.[] | select(.isDraft and (.tagName | startswith("actions-staging-"))) | .tagName' \
             | while IFS= read -r stale_tag; do
                 [[ -z "$stale_tag" ]] || gh release delete "$stale_tag" \
-                  --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+                  --repo "$GITHUB_REPOSITORY" --yes
               done
           gh release create "$STAGING_TAG" \
             --repo "$GITHUB_REPOSITORY" \
@@ -193,9 +193,26 @@ jobs:
       - name: 运行测试
         shell: bash
         run: |
-          if ! npm run test:sidecar > "$RUNNER_TEMP/tests.log" 2>&1 \
-            || ! npm run test:release >> "$RUNNER_TEMP/tests.log" 2>&1; then
-            echo "测试失败；为避免公开源码片段，详细日志不输出到 Public 仓库"
+          set +e
+          npm run test:sidecar > "$RUNNER_TEMP/sidecar-tests.log" 2>&1
+          sidecar_status=$?
+          npm run test:release > "$RUNNER_TEMP/release-tests.log" 2>&1
+          release_status=$?
+          set -e
+          if (( sidecar_status != 0 || release_status != 0 )); then
+            echo "测试失败；仅输出失败测试名称和数量，不输出断言内容或源码片段"
+            python - "$RUNNER_TEMP/sidecar-tests.log" "$RUNNER_TEMP/release-tests.log" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          allowed = re.compile(r"^(?:FAIL|ERROR): |^Ran \d+ tests?|^FAILED \(")
+          for log_path in map(Path, sys.argv[1:]):
+              print(f"[{log_path.stem}]")
+              for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                  if allowed.match(line):
+                      print(line)
+          PY
             exit 1
           fi
 
@@ -421,4 +438,9 @@ jobs:
     steps:
       - name: 删除 Draft Release 和临时标签
         shell: bash
-        run: gh release delete "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+        run: |
+          if gh release view "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" --yes
+          else
+            echo "临时 Draft Release 已不存在，无需清理"
+          fi
