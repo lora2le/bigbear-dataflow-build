@@ -291,7 +291,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/${{ matrix.artifact }}.tar.gz"
+          archive="../${{ matrix.artifact }}.tar.gz"
           if [[ "${{ matrix.platform }}" == "macos" ]]; then
             export COPYFILE_DISABLE=1
           fi
