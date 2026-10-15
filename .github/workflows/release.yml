@@ -229,7 +229,28 @@ jobs:
             npm run tauri build -- --target "${{ matrix.target }}" --bundles nsis \
               --config src-tauri/.generated/tauri.release.conf.json > "$build_log" 2>&1
           fi || {
-            echo "${{ matrix.label }} 构建失败；为避免公开源码片段，详细日志不输出到 Public 仓库"
+            echo "${{ matrix.label }} 构建失败；以下为脱敏后的构建器错误摘要："
+            python - "$build_log" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          patterns = re.compile(r"(?:^error(?:\[[^\]]+\])?:|^error in script|^Error:|\b(?:NSIS|makensis)\b|\bfailed to\b)", re.IGNORECASE)
+          windows_path = re.compile(r'[A-Za-z]:[\\/][^\s:\"]+')
+          unix_path = re.compile(r'/(?:[^\s/]+/)+[^\s:\"]+')
+          lines = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines()
+          summary = []
+          for raw in lines:
+              line = raw.strip()
+              if patterns.search(line):
+                  line = windows_path.sub("<path>", line)
+                  line = unix_path.sub("<path>", line)
+                  summary.append(line[:500])
+          for line in summary[-40:]:
+              print(line)
+          if not summary:
+              print("未识别到可公开的构建器错误行；请在私有运行环境读取完整日志。")
+          PY
             exit 1
           }
 
