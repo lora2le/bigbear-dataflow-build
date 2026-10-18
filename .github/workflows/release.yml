@@ -262,6 +262,21 @@ jobs:
           app_path="$(find src-tauri/target -path '*/release/bundle/macos/大熊的数据流.app' -type d -print -quit)"
           [[ -n "$app_path" ]] || { echo "缺少 .app"; exit 1; }
           codesign --verify --deep --strict "$app_path"
+          sidecar="$(find "$app_path/Contents" -type f -name 'content-sidecar-*' -print -quit)"
+          [[ -n "$sidecar" ]] || { echo "缺少 macOS Sidecar"; exit 1; }
+          smoke_root="$RUNNER_TEMP/bigbear-sidecar-smoke"
+          mkdir -p "$smoke_root/config" "$smoke_root/data"
+          printf '%s\n' '{"id":"cloud-smoke","method":"hello","params":{}}' |
+            "$sidecar" --config-dir "$smoke_root/config" --data-dir "$smoke_root/data" > "$smoke_root/reply.json"
+          python - "$smoke_root/reply.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          reply = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if reply.get("id") != "cloud-smoke" or reply.get("result", {}).get("protocol") != 1:
+              raise SystemExit("macOS Sidecar 启动检查失败")
+          PY
           unexpected_source="$(find "$app_path" -type f \( -name '*.py' -o -name '*.pyc' -o -name '*.ts' -o -name '*.tsx' -o -name '*.rs' -o -name '*.map' -o -name 'package.json' -o -name 'Cargo.toml' \) -print)"
           [[ -z "$unexpected_source" ]] || { echo "安装包中出现源码或构建文件"; exit 1; }
 
