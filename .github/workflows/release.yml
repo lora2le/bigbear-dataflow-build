@@ -91,6 +91,7 @@ jobs:
       BIGBEAR_VALIDATION_ONLY: ${{ inputs.publish && '0' || '1' }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      BIGBEAR_MANAGED_SERVICE_URL: ${{ secrets.MANAGED_SERVICE_URL }}
 
     steps:
       - name: 从 Gitee 私有仓库读取指定提交
@@ -181,6 +182,14 @@ jobs:
             echo "正式发布缺少 TAURI_SIGNING_PRIVATE_KEY"
             exit 1
           fi
+          if [[ "$PUBLISH_RELEASE" == "true" && -z "$BIGBEAR_MANAGED_SERVICE_URL" ]]; then
+            echo "正式发布缺少 MANAGED_SERVICE_URL"
+            exit 1
+          fi
+          if [[ "$PUBLISH_RELEASE" == "true" && ! "$BIGBEAR_MANAGED_SERVICE_URL" =~ ^https://[^/]+$ ]]; then
+            echo "MANAGED_SERVICE_URL 必须是完整 HTTPS 地址，且不能带路径或末尾斜杠"
+            exit 1
+          fi
 
       - name: 安装锁定依赖
         shell: bash
@@ -261,7 +270,7 @@ jobs:
           set -euo pipefail
           app_path="$(find src-tauri/target -path '*/release/bundle/macos/大熊的数据流.app' -type d -print -quit)"
           [[ -n "$app_path" ]] || { echo "缺少 .app"; exit 1; }
-          codesign --verify --deep --strict "$app_path"
+          bash scripts/resign_macos_bundle.sh "$app_path" "${MACOS_SIGNING_IDENTITY:--}" src-tauri/entitlements.plist
           sidecar="$(find "$app_path/Contents" -type f -name 'content-sidecar' -print -quit)"
           [[ -n "$sidecar" ]] || { echo "缺少 macOS Sidecar"; exit 1; }
           smoke_root="$RUNNER_TEMP/bigbear-sidecar-smoke"
