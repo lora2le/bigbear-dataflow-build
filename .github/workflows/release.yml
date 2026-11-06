@@ -232,7 +232,7 @@ jobs:
           rm -rf -- "src-tauri/target/${{ matrix.target }}/release/bundle"
           build_log="$RUNNER_TEMP/build-${{ matrix.artifact }}.log"
           if [[ "${{ matrix.platform }}" == "macos" ]]; then
-            npm run tauri build -- --target "${{ matrix.target }}" \
+            npm run tauri build -- --verbose --target "${{ matrix.target }}" \
               --config src-tauri/.generated/tauri.release.conf.json > "$build_log" 2>&1
           else
             npm run tauri build -- --target "${{ matrix.target }}" --bundles nsis \
@@ -244,13 +244,13 @@ jobs:
           import sys
           from pathlib import Path
 
-          patterns = re.compile(r"(?:^error(?:\[[^\]]+\])?:|^error in script|^Error:|\b(?:NSIS|makensis)\b|\bfailed to\b)", re.IGNORECASE)
+          patterns = re.compile(r"(?:^error(?:\[[^\]]+\])?:|^error in script|^Error:|\b(?:NSIS|makensis)\b|\bfailed to\b|\bhdiutil:|\b(?:execution error|diskimages-helper):|\b(?:Creating|Mounting|Unmounting|Converting) disk image|\bResource (?:busy|temporarily unavailable)\b|\bNo space left on device\b)", re.IGNORECASE)
           windows_path = re.compile(r'[A-Za-z]:[\\/][^\s:\"]+')
           unix_path = re.compile(r'/(?:[^\s/]+/)+[^\s:\"]+')
           lines = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines()
           summary = []
           for raw in lines:
-              line = raw.strip()
+              line = re.sub(r"\x1b\[[0-9;]*m", "", raw).strip()
               if patterns.search(line):
                   line = windows_path.sub("<path>", line)
                   line = unix_path.sub("<path>", line)
