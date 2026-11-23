@@ -202,9 +202,20 @@ jobs:
       - name: 检查商品后端与购买界面
         shell: bash
         run: |
-          if ! npm run test:managed > "$RUNNER_TEMP/managed-tests.log" 2>&1; then
-            echo "商品后端检查失败，详细日志保留在临时runner中"
-            exit 1
+          # 服务端依赖 Unix 文件权限；在两个 macOS runner 校验，Windows 仍完整执行客户端检查。
+          if [[ "${{ matrix.platform }}" == "macos" ]]; then
+            if ! npm run test:managed > "$RUNNER_TEMP/managed-tests.log" 2>&1; then
+              echo "商品后端检查失败；仅输出失败测试名称和数量"
+              python - "$RUNNER_TEMP/managed-tests.log" <<'PYLOG'
+          import re
+          import sys
+          from pathlib import Path
+          for line in Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
+              if re.match(r"^(?:FAIL|ERROR): |^Ran \d+ tests?|^FAILED \(", line):
+                  print(line)
+          PYLOG
+              exit 1
+            fi
           fi
           if ! npm run test:frontend > "$RUNNER_TEMP/frontend-tests.log" 2>&1; then
             echo "购买与前端检查失败，详细日志保留在临时runner中"
