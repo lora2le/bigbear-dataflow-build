@@ -199,6 +199,18 @@ jobs:
             exit 1
           fi
 
+      - name: 检查商品后端与购买界面
+        shell: bash
+        run: |
+          if ! npm run test:managed > "$RUNNER_TEMP/managed-tests.log" 2>&1; then
+            echo "商品后端检查失败，详细日志保留在临时runner中"
+            exit 1
+          fi
+          if ! npm run test:frontend > "$RUNNER_TEMP/frontend-tests.log" 2>&1; then
+            echo "购买与前端检查失败，详细日志保留在临时runner中"
+            exit 1
+          fi
+
       - name: 运行测试
         shell: bash
         run: |
