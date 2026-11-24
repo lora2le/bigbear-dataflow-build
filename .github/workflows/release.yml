@@ -69,12 +69,12 @@ jobs:
       matrix:
         include:
           - label: macOS Apple Silicon
-            runner: macos-15
+            runner: macos-26
             target: aarch64-apple-darwin
             artifact: macos-arm64
             platform: macos
           - label: macOS Intel
-            runner: macos-15-intel
+            runner: macos-26-intel
             target: x86_64-apple-darwin
             artifact: macos-x64
             platform: macos
