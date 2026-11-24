@@ -507,10 +507,6 @@ jobs:
       - name: 删除 Draft Release 和临时标签
         shell: bash
         run: |
-          # 验证构建保留 1 小时下载窗口（156MB 安装包经代理约需 20 分钟）；正式发布仍立即清理。
-          if [[ "$PUBLISH_RELEASE" != "true" ]]; then
-            sleep 3600
-          fi
           if gh release view "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release delete "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" --yes
           else
