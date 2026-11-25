@@ -13,8 +13,13 @@ on:
         required: true
         type: string
       publish:
-        description: 是否正式发布到 CNB
+        description: 正式发布并同步官网（关闭时仅验证构建）
         required: true
+        default: false
+        type: boolean
+      sync_only:
+        description: 仅重试已发布版本的下载源与官网同步（必须同时开启正式发布）
+        required: false
         default: false
         type: boolean
 
@@ -35,6 +40,7 @@ env:
 jobs:
   prepare_staging:
     name: 准备临时二进制中转
+    if: ${{ !inputs.sync_only }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -493,6 +499,93 @@ jobs:
           git push --force cnb "refs/tags/${RELEASE_TAG}"
           cd "$GITHUB_WORKSPACE/source"
           python 构建/publish_cnb.py 发布/正式产物
+
+  sync_website:
+    name: 同步官网与下载源
+    if: ${{ always() && (inputs.sync_only || (inputs.publish && needs.release.result == 'success')) }}
+    needs: release
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: 从 Gitee 私有仓库读取指定提交
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          GITEE_DEPLOY_KEY: ${{ secrets.GITEE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$PUBLISH_RELEASE" == "true" && "$EXPECTED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ && "$SOURCE_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "官网同步必须指定正式发布标签与提交"; exit 1; }
+          [[ -n "$GITEE_DEPLOY_KEY" ]] || { echo "缺少 GITEE_DEPLOY_KEY"; exit 1; }
+          key_path="$RUNNER_TEMP/gitee-deploy-key"
+          known_hosts="$RUNNER_TEMP/gitee-known-hosts"
+          cleanup_key() { rm -f -- "$key_path"; }
+          trap cleanup_key EXIT
+          printf '%s\n' "$GITEE_DEPLOY_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          printf '%s\n' 'gitee.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEKxHSJ7084RmkJ4YdEi5tngynE8aZe2uEoVVsB/OvYN' > "$known_hosts"
+          git init --quiet "$SOURCE_DIR"
+          git -C "$SOURCE_DIR" remote add origin git@gitee.com:daxionglab/bigbear-dataflow.git
+          git -C "$SOURCE_DIR" \
+            -c core.sshCommand="ssh -i '$key_path' -o IdentitiesOnly=yes -o UserKnownHostsFile='$known_hosts' -o StrictHostKeyChecking=yes" \
+            fetch --quiet --no-tags --depth=1 origin "$SOURCE_REF"
+          actual_commit="$(git -C "$SOURCE_DIR" rev-parse 'FETCH_HEAD^{commit}')"
+          [[ "$actual_commit" == "$EXPECTED_SOURCE_COMMIT" ]] \
+            || { echo "Gitee 实际提交与发布输入不一致"; exit 1; }
+          git -C "$SOURCE_DIR" checkout --quiet --detach "$actual_commit"
+          git -C "$SOURCE_DIR" remote remove origin
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: 安装 Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: 安装官网锁定依赖
+        shell: bash
+        run: |
+          if ! npm ci > "$RUNNER_TEMP/website-npm-install.log" 2>&1; then
+            echo "官网依赖安装失败；详细日志不输出到 Public 仓库"
+            exit 1
+          fi
+
+      - name: 同步正式产物并部署核验同版本官网
+        shell: bash
+        env:
+          EVOXT_IP: ${{ secrets.WEBSITE_SSH_HOST }}
+          EVOXT_USERNAME: root
+          EVOXT_SSH_FILE: ${{ runner.temp }}/website-deploy-key
+          WEBSITE_SSH_KEY: ${{ secrets.WEBSITE_SSH_KEY }}
+          WEBSITE_SSH_KNOWN_HOSTS: ${{ secrets.WEBSITE_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$EVOXT_IP" && -n "$WEBSITE_SSH_KEY" && -n "$WEBSITE_SSH_KNOWN_HOSTS" ]] \
+            || { echo "缺少官网受限发布凭据，请运行构建/lib/install_release_receiver.py"; exit 1; }
+          cleanup_key() { rm -f -- "$EVOXT_SSH_FILE"; }
+          trap cleanup_key EXIT
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$WEBSITE_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          printf '%s\n' "$WEBSITE_SSH_KEY" > "$EVOXT_SSH_FILE"
+          chmod 600 "$EVOXT_SSH_FILE"
+          python3 - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, '构建')
+          from deploy_website import main
+          sys.argv = ['deploy_website.py', '--expected-version', os.environ['SOURCE_REF'].removeprefix('refs/tags/v')]
+          try:
+              main()
+          except Exception as error:
+              print(f'官网同步失败：{error}；只重试官网同步，不要重复发布安装包。', file=sys.stderr)
+              sys.exit(1)
+          PY
 
   cleanup_staging:
     name: 清理临时二进制中转
