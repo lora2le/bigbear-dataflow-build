@@ -339,6 +339,9 @@ jobs:
           $sidecars = @(Get-ChildItem src-tauri/binaries -File -Filter "content-sidecar-x86_64-pc-windows-msvc.exe")
           if ($sidecars.Count -ne 1) { throw "缺少 Windows x64 Sidecar" }
 
+          python scripts/lib/windows_executable.py "src-tauri/target/${{ matrix.target }}/release/batch-content-extractor.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Windows 主程序 GUI 子系统校验失败" }
+
           $smokeRoot = Join-Path $env:RUNNER_TEMP "bigbear-sidecar-smoke"
           $configDir = Join-Path $smokeRoot "config"
           $dataDir = Join-Path $smokeRoot "data"
